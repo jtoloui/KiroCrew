@@ -801,8 +801,88 @@ async def test_poll_idc_resolves_profile_arn(tmp_path, monkeypatch):
     assert saved.profile_arn == "arn:aws:kiro:us-east-1:1:profile/p1"
     # The control-plane call carried the fresh bearer token.
     cp_url, cp_body = session.calls[-1]
-    assert "kirocontrolplanebearerservice" in cp_url
+    assert cp_url == "https://codewhisperer.us-east-1.amazonaws.com/"
     assert cp_body == {"maxResults": 10}
+
+
+def test_profile_endpoint_hosts_are_not_a_region_pattern():
+    """The two hosts differ by more than their region, so no format string can build them.
+
+    us-east-1 is `codewhisperer.`, eu-central-1 is `q.` -- both read out of the client
+    kiro-cli ships. Formatting a region into one pattern is what made the original
+    `q.us-east-1` host wrong, so pin both literals and reject an unknown region rather
+    than letting it produce a plausible-looking hostname.
+    """
+    from kiro_crew.auth.login import control_plane
+
+    assert control_plane.PROFILE_REGIONS == ("us-east-1", "eu-central-1")
+    assert control_plane.control_plane_url("us-east-1") == (
+        "https://codewhisperer.us-east-1.amazonaws.com/"
+    )
+    assert control_plane.control_plane_url("eu-central-1") == (
+        "https://q.eu-central-1.amazonaws.com/"
+    )
+    with pytest.raises(control_plane.ControlPlaneError):
+        control_plane.control_plane_url("eu-west-1")
+
+
+@pytest.mark.asyncio
+async def test_poll_idc_falls_through_to_the_second_profile_region(tmp_path, monkeypatch):
+    """A profile lives in us-east-1 OR eu-central-1, never in the login's own region.
+
+    The IdC region (here eu-west-1) has no ListAvailableProfiles endpoint at all, so
+    interpolating it produced a hostname that does not resolve and every enterprise
+    login died on it. Both supported profile regions are asked instead, in order.
+    """
+    service, session = _service(
+        tmp_path,
+        responses=[
+            _FakeResp(200, {"accessToken": "at-eu", "refreshToken": "rt-eu", "expiresIn": 3600}),
+            _FakeResp(200, {"profiles": []}),
+            _FakeResp(200, {"profiles": [{"arn": "arn:aws:kiro:eu-central-1:1:profile/eu"}]}),
+        ],
+    )
+    begin = await _begin_oidc(
+        service,
+        monkeypatch,
+        "idc",
+        start_url="https://acme.awsapps.com/start",
+        region="eu-west-1",
+    )
+    assert await service.poll_device(begin["login_id"]) == {
+        "status": "authorized",
+        "provider": "Enterprise",
+    }
+    saved = TokenStore(tmp_path).resolve()
+    assert saved is not None and saved.profile_arn == "arn:aws:kiro:eu-central-1:1:profile/eu"
+    assert [url for url, _ in session.calls[-2:]] == [
+        "https://codewhisperer.us-east-1.amazonaws.com/",
+        "https://q.eu-central-1.amazonaws.com/",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_poll_idc_unreachable_control_plane_is_error_not_a_raise(tmp_path, monkeypatch):
+    """A connect failure resolving the profile must NOT become a 502.
+
+    The handler turns an escaping ``aiohttp.ClientError`` into
+    ``auth_service_unreachable``, blaming the auth service for a control-plane DNS
+    failure — and the dashboard treats that 502 as terminal. The token is already
+    redeemed here, so the honest answer is a terminal ``error`` on this login.
+    """
+    service, _ = _service(
+        tmp_path,
+        responses=[
+            _FakeResp(200, {"accessToken": "at-dns", "expiresIn": 3600}),
+            _FailingResp(aiohttp.ClientConnectionError("nodename nor servname provided")),
+            _FailingResp(aiohttp.ClientConnectionError("nodename nor servname provided")),
+        ],
+    )
+    begin = await _begin_oidc(
+        service, monkeypatch, "idc", start_url="https://acme.awsapps.com/start"
+    )
+    assert await service.poll_device(begin["login_id"]) == {"status": "error"}
+    assert TokenStore(tmp_path).resolve() is None
 
 
 @pytest.mark.asyncio
@@ -811,6 +891,7 @@ async def test_poll_idc_with_no_profiles_is_error_and_saves_nothing(tmp_path, mo
         tmp_path,
         responses=[
             _FakeResp(200, {"accessToken": "at-3", "expiresIn": 3600}),
+            _FakeResp(200, {"profiles": []}),
             _FakeResp(200, {"profiles": []}),
         ],
     )
@@ -830,6 +911,7 @@ async def test_poll_idc_control_plane_failure_is_error(tmp_path, monkeypatch):
         tmp_path,
         responses=[
             _FakeResp(200, {"accessToken": "at-4", "expiresIn": 3600}),
+            _FakeResp(403, {"message": "forbidden"}),
             _FakeResp(403, {"message": "forbidden"}),
         ],
     )

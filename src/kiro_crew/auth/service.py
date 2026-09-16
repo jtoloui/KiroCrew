@@ -585,7 +585,7 @@ class KasLoginService:
             # answering "pending" would only loop the dashboard until expiry.
             try:
                 profiles = await control_plane.list_available_profiles(
-                    token.access_token, region=pending.region, session=session
+                    token.access_token, session=session
                 )
             except control_plane.ControlPlaneError as err:
                 logger.warning("could not resolve IdC profile ARN: %s", err)

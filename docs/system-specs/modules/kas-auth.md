@@ -140,11 +140,45 @@ be read, because that answer still proves the service is up — so only a sustai
 outage crosses it, and the count disappears with the login entry. The IdC profile-ARN
 resolution that follows an approved token carries **no** budget — its device code is
 already redeemed, so a later poll cannot re-obtain the token and `pending` would only
-loop until expiry.
+loop until expiry. It also carries **no** transport class of its own: every failure
+there, connection-level included, becomes a `ControlPlaneError` → terminal `error`.
+Letting an `aiohttp.ClientError` escape that leg instead reaches the poll route's
+`auth_service_unreachable` handler and reports a coded 502 blaming the *auth* service,
+which was reachable and had already issued the token.
 
 Every request on the shared auth session is bounded by an explicit `ClientTimeout`
 (`total=30s`, `connect=10s`). aiohttp's own default is five minutes, which on a
 black-holed route holds a poll far past its own cadence.
+
+### Profile-ARN resolution (IdC only)
+
+`POST` to a per-region host (`codewhisperer.us-east-1.amazonaws.com` /
+`q.eu-central-1.amazonaws.com`), AWS JSON 1.0, bearer auth,
+`X-Amz-Target: AmazonCodeWhispererService.ListAvailableProfiles`, body
+`{"maxResults": 10}` → `{"profiles": [{"arn", "profileName"}], "nextToken"}`. Contract
+and both hosts read out of the client kiro-cli ships (`amzn_codewhisperer_client`).
+Probed against the live service: omitting the Authorization header answers HTTP 400
+`com.amazon.aws.codewhisperer#ValidationException` "Missing bearer token in the
+authorization header", which is what pins host, target and protocol; the former
+`KiroControlPlaneBearerService` target answers HTTP 400
+`com.amazon.coral.service#UnknownOperationException`, the same reply a nonsense
+operation name gets.
+
+**The host names are not uniform.** us-east-1 is `codewhisperer.`, eu-central-1 is
+`q.` — so the host cannot be built by formatting a region into a pattern, which is how
+the original `q.<region>` shape came to be wrong for us-east-1. The same client also
+carries `q.us-gov-{east,west}-1`; GovCloud is deliberately not in the table.
+
+**The login's IdC region is not a host here.** Only two commercial endpoints exist, so
+an eu-west-1 tenant has no eu-west-1 endpoint to ask. Both are queried in order and the
+first non-empty answer wins; the region that matters downstream is the one in the
+returned ARN's 4th segment. All regions failing is a `ControlPlaneError`; all answering
+empty is "no available profiles". An unknown region has no endpoint and raises rather
+than guessing a hostname.
+
+**An invalid bearer token is not distinguishable here.** It answers HTTP 200
+`{"profiles": []}`, exactly like an account with no Q Developer profile, so both reach
+the user as "no available profiles" rather than as an auth error.
 
 ### Social (Google / GitHub)
 
